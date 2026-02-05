@@ -2,14 +2,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from database import init_trade_tables  # 테이블 초기화 함수 임포트
-from routers import news, trade, rank   # trade, rank 라우터 추가
+from routers import news, trade, rank, user
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
 from ranking_logic import update_ranking_snapshot
 
 # 스케줄러 설정
 scheduler = BackgroundScheduler()
-scheduler.add_job(update_ranking_snapshot, 'interval', minutes=12)
+scheduler.add_job(update_ranking_snapshot, 'interval', minutes=1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -52,6 +52,7 @@ app.add_middleware(
 app.include_router(news.router)
 app.include_router(trade.router)
 app.include_router(rank.router)
+app.include_router(user.router)
 
 @app.get("/")
 async def health_check():

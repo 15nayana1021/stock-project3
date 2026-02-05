@@ -2,8 +2,9 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 import aiosqlite
 from database import get_db_connection
+from services.gamification import gain_exp, check_quest
 
-router = APIRouter(prefix="/api/trade", tags=["Trading System 📈"])
+router = APIRouter(prefix="/api/trade", tags=["Trade"])
 
 
 # 1. 데이터 모델 (Schema)
@@ -25,7 +26,7 @@ async def init_user(user: UserCreate, db: aiosqlite.Connection = Depends(get_db_
     try:
         # 1. 유저 생성 (INSERT 실행)
         cursor = await db.execute(
-            "INSERT INTO users (username, current_balance) VALUES (?, 1000000)", 
+            "INSERT INTO users (username, balance) VALUES (?, 1000000)", 
             (user.username,)
         )
         await db.commit()  # 저장을 먼저 해야 ID가 생깁니다.
@@ -44,14 +45,14 @@ async def init_user(user: UserCreate, db: aiosqlite.Connection = Depends(get_db_
         
         return {
             "status": "created", 
-            "user_id": user_id, 
+            "user_id": user_id,
             "balance": balance, 
             "message": f"환영합니다, {user.username}님! 지갑 생성 완료! (100만원 지급)"
         }
         
     except aiosqlite.IntegrityError:
         # 이미 존재하는 아이디인 경우
-        cursor = await db.execute("SELECT id, current_balance FROM users WHERE username = ?", (user.username,))
+        cursor = await db.execute("SELECT id, balance FROM users WHERE username = ?", (user.username,))
         row = await cursor.fetchone()
         return {
             "status": "exists", 
@@ -66,44 +67,60 @@ async def init_user(user: UserCreate, db: aiosqlite.Connection = Depends(get_db_
 async def buy_stock(trade: TradeRequest, db: aiosqlite.Connection = Depends(get_db_connection)):
     """
     [매수 트랜잭션]
-    1. 잔액 확인 -> 2. 잔액 차감 -> 3. 주식 지급 -> 4. 장부 기록
-    이 모든 과정이 원자적(Atomic)으로 수행됩니다.
+    1. 잔액 확인 (balance) -> 2. 잔액 차감 -> 3. 주식 지급 -> 4. 경험치/퀘스트
     """
     total_cost = trade.price * trade.quantity
     
     try:
-        # 🔒 트랜잭션 시작 (다른 사람이 동시에 내 돈을 건드리지 못하게 함)
+        # 🔒 트랜잭션 시작
         await db.execute("BEGIN IMMEDIATE") 
         
         # 1. 잔액 확인
-        cursor = await db.execute("SELECT current_balance FROM users WHERE id = ?", (trade.user_id,))
+        cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (trade.user_id,))
         row = await cursor.fetchone()
         
         if not row:
             raise HTTPException(status_code=404, detail="유저를 찾을 수 없습니다.")
         
-        current_balance = row[0]
+        balance_amount = row[0]
         
-        if current_balance < total_cost:
+        if balance_amount < total_cost:
             raise HTTPException(status_code=400, detail="잔액이 부족합니다.")
 
         # 2. 잔액 차감
-        new_balance = current_balance - total_cost
-        await db.execute("UPDATE users SET current_balance = ? WHERE id = ?", (new_balance, trade.user_id))
+        new_balance = balance_amount - total_cost
+        await db.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, trade.user_id))
 
-        # 3. 주식 보유량 업데이트 (Upsert Logic)
+        # 3. 주식 보유량 업데이트
         cursor = await db.execute("SELECT quantity, average_price FROM holdings WHERE user_id = ? AND company_name = ?", (trade.user_id, trade.company_name))
         holding = await cursor.fetchone()
         
         if holding:
-            # 이미 가지고 있던 주식이면 -> 평단가 수정 및 수량 추가
+            # 추가 매수
             old_qty, old_avg = holding
             new_qty = old_qty + trade.quantity
             new_avg = ((old_qty * old_avg) + total_cost) / new_qty
             await db.execute("UPDATE holdings SET quantity = ?, average_price = ? WHERE user_id = ? AND company_name = ?", (new_qty, new_avg, trade.user_id, trade.company_name))
         else:
-            # 처음 사는 주식이면 -> 새로 추가
+            # 신규 매수
             await db.execute("INSERT INTO holdings (user_id, company_name, quantity, average_price) VALUES (?, ?, ?, ?)", (trade.user_id, trade.company_name, trade.quantity, trade.price))
+
+        await db.commit()
+        try:
+            # 1. 경험치 지급 (20점, 레벨 제한 없음)
+            #await gain_exp(trade.user_id, 20)
+            
+            # 2. '첫 주식 매수' 퀘스트 체크
+            await check_quest(trade.user_id, "trade_first")
+        except Exception as e:
+            # 보상 지급 중 에러가 나도, 주식 산 건 취소되면 안 되니까 로그만 찍고 넘어감
+            print(f"⚠️ 보상 지급 중 에러 발생: {e}")
+
+        return {"message": "매수 체결 완료!", "balance": new_balance}
+
+    except Exception as e:
+        await db.rollback() # 에러 나면 주식 사기 전으로 되돌림
+        raise e
 
         # 4. 거래 원장(Ledger) 기록
         await db.execute("""
@@ -134,7 +151,7 @@ async def get_user_info(user_id: int, db: aiosqlite.Connection = Depends(get_db_
     앱 메인화면에 띄워줄 유저의 현재 잔액과 보유 주식 정보를 가져옵니다.
     """
     # 1. 잔액 조회
-    cursor = await db.execute("SELECT username, current_balance FROM users WHERE id = ?", (user_id,))
+    cursor = await db.execute("SELECT username, balance FROM users WHERE id = ?", (user_id,))
     user_row = await cursor.fetchone()
     
     if not user_row:
@@ -173,17 +190,17 @@ async def give_reward(reward: RewardRequest, db: aiosqlite.Connection = Depends(
         await db.execute("BEGIN IMMEDIATE") # 트랜잭션 시작
 
         # 1. 유저 존재 확인 및 현재 잔액 조회
-        cursor = await db.execute("SELECT current_balance FROM users WHERE id = ?", (reward.user_id,))
+        cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (reward.user_id,))
         row = await cursor.fetchone()
         
         if not row:
             raise HTTPException(status_code=404, detail="유저를 찾을 수 없습니다.")
             
-        current_balance = row[0]
+        balance = row[0]
         
         # 2. 잔액 증가 (더하기)
-        new_balance = current_balance + reward.amount
-        await db.execute("UPDATE users SET current_balance = ? WHERE id = ?", (new_balance, reward.user_id))
+        new_balance = balance + reward.amount
+        await db.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, reward.user_id))
 
         # 3. 거래 원장(Ledger)에 기록 (돈의 출처 남기기)
         await db.execute("""
@@ -210,10 +227,11 @@ async def give_reward(reward: RewardRequest, db: aiosqlite.Connection = Depends(
 async def sell_stock(trade: TradeRequest, db: aiosqlite.Connection = Depends(get_db_connection)):
     """
     [매도 트랜잭션]
-    1. 보유 주식 확인 (없으면 에러)
+    1. 보유 주식 확인
     2. 주식 차감
-    3. 잔액 증가 (돈 받기)
-    4. 거래 장부 기록
+    3. 잔액 증가
+    4. 거래 장부 기록 (transactions 테이블)
+    5. 경험치 및 퀘스트 보상 지급 (New!)
     """
     total_income = trade.price * trade.quantity
     
@@ -238,29 +256,46 @@ async def sell_stock(trade: TradeRequest, db: aiosqlite.Connection = Depends(get
         # 2. 주식 수량 차감
         new_qty = current_qty - trade.quantity
         
-        # 수량이 0이 되어도 기록을 위해 행을 삭제하지 않고 0으로 남겨두는 방식을 추천합니다.
-        # (나중에 '내가 예전에 이 주식 샀었나?' 확인할 때 좋습니다)
+        # (사용자님의 좋은 습관: 수량이 0이 되어도 기록을 남김)
         await db.execute("""
             UPDATE holdings SET quantity = ? 
             WHERE user_id = ? AND company_name = ?
         """, (new_qty, trade.user_id, trade.company_name))
 
         # 3. 유저 잔액 증가 (돈 받기)
-        cursor = await db.execute("SELECT current_balance FROM users WHERE id = ?", (trade.user_id,))
+        cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (trade.user_id,))
         row = await cursor.fetchone()
-        current_balance = row[0]
-        new_balance = current_balance + total_income
         
-        await db.execute("UPDATE users SET current_balance = ? WHERE id = ?", (new_balance, trade.user_id))
+        if not row:
+            raise HTTPException(status_code=404, detail="유저를 찾을 수 없습니다.")
+
+        balance = row[0]
+        new_balance = balance + total_income
+        
+        await db.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, trade.user_id))
 
         # 4. 거래 원장(Ledger) 기록
-        # 매도는 돈이 들어오므로 amount가 양수(+)입니다.
+        # (기존에 작성하신 꼼꼼한 기록 코드 유지)
         await db.execute("""
             INSERT INTO transactions (user_id, transaction_type, amount, balance_after, description)
             VALUES (?, 'SELL', ?, ?, ?)
         """, (trade.user_id, total_income, new_balance, f"{trade.company_name} {trade.quantity}주 매도"))
 
-        await db.commit() # 확정
+        await db.commit() # ✅ 여기서 DB 저장 완료!
+
+        # ---------------------------------------------------------
+        # 👇 [추가된 부분] 매도 보상 지급 (저장이 확실히 된 후 실행)
+        # ---------------------------------------------------------
+        try:
+            # 1. 매도 경험치 20점 지급
+            #await gain_exp(trade.user_id, 20)
+            
+            # 2. '첫 매도' 퀘스트 체크 (ID: trade_sell_first)
+            await check_quest(trade.user_id, "trade_sell_first")
+            
+        except Exception as e:
+            # 보상 지급 중 에러가 나도, 주식 판 건 취소되면 안 되니까 로그만 찍고 넘어감
+            print(f"⚠️ 보상 지급 중 에러 발생: {e}")
 
         return {
             "status": "success",
@@ -301,13 +336,13 @@ async def place_order(order: OrderRequest, db: aiosqlite.Connection = Depends(ge
 
         if order.order_type == "BUY":
             # [매수] 잔액 확인 및 차감 (돈 묶어두기)
-            cursor = await db.execute("SELECT current_balance FROM users WHERE id = ?", (order.user_id,))
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (order.user_id,))
             row = await cursor.fetchone()
             if not row or row[0] < total_amount:
                 raise HTTPException(status_code=400, detail="주문 가능 잔액이 부족합니다.")
             
             new_balance = row[0] - total_amount
-            await db.execute("UPDATE users SET current_balance = ? WHERE id = ?", (new_balance, order.user_id))
+            await db.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, order.user_id))
             
         elif order.order_type == "SELL":
             # [매도] 주식 보유량 확인 및 차감 (주식 묶어두기)
@@ -393,7 +428,7 @@ async def cancel_order(order_id: int, db: aiosqlite.Connection = Depends(get_db_
         
         if order['order_type'] == 'BUY':
             refund = price * quantity
-            await db.execute("UPDATE users SET current_balance = current_balance + ? WHERE id = ?", (refund, user_id))
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (refund, user_id))
             print(f"💰 [환불] 유저 {user_id}에게 {refund}원 환불 완료")
             
         elif order['order_type'] == 'SELL':
@@ -469,7 +504,7 @@ async def process_market_price_change(company_name: str, current_price: float, d
         for order in sell_orders:
             # 판매 대금 지급
             income = order['price'] * order['quantity']
-            await db.execute("UPDATE users SET current_balance = current_balance + ? WHERE id = ?", (income, order['user_id']))
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (income, order['user_id']))
             
             # 주문 완료 처리
             await db.execute("UPDATE orders SET status = 'FILLED' WHERE id = ?", (order['id'],))
@@ -485,3 +520,36 @@ async def process_market_price_change(company_name: str, current_price: float, d
     except Exception as e:
         await db.rollback()
         raise HTTPException(500, str(e))
+    
+# 🛑 [검문소 함수] 레벨 체크 디펜던시
+async def verify_level_5(db: aiosqlite.Connection = Depends(get_db_connection)):
+    user_id = 1  # (테스트용 고정 ID)
+    cursor = await db.execute("SELECT level FROM users WHERE id = ?", (user_id,))
+    row = await cursor.fetchone()
+    
+    current_level = row[0] if row else 1
+    
+    if current_level < 5:
+        # 🚫 레벨 부족하면 403 에러 발생!
+        raise HTTPException(
+            status_code=403, 
+            detail=f"🔒 호가창은 LV.5부터 이용 가능합니다. (현재: LV.{current_level})"
+        )
+    return True
+
+# ✅ 호가창 API (검문소 통과해야 실행됨)
+@router.get("/orderbook/{company_name}")
+async def get_order_book(
+    company_name: str, 
+    is_authorized: bool = Depends(verify_level_5) # 👈 여기서 검사!
+):
+    """
+    [호가창 조회]
+    레벨 5 이상인 유저만 주식의 매수/매도 대기 물량을 볼 수 있습니다.
+    """
+    # (여기서는 실제 호가 데이터 대신 더미 데이터 반환)
+    return {
+        "company": company_name,
+        "asks": [{"price": 81000, "qty": 10}, {"price": 82000, "qty": 50}], # 팔려는 사람
+        "bids": [{"price": 79000, "qty": 20}, {"price": 78000, "qty": 100}] # 살려는 사람
+    }
