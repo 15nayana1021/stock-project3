@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import aiosqlite
 from database import get_db_connection
 from services.gamification import gain_exp, check_quest
+from domain_models import Order, OrderType, OrderSide
 
 router = APIRouter(prefix="/api/trade", tags=["Trade"])
 
@@ -282,10 +283,8 @@ async def sell_stock(trade: TradeRequest, db: aiosqlite.Connection = Depends(get
         """, (trade.user_id, total_income, new_balance, f"{trade.company_name} {trade.quantity}주 매도"))
 
         await db.commit() # ✅ 여기서 DB 저장 완료!
-
-        # ---------------------------------------------------------
-        # 👇 [추가된 부분] 매도 보상 지급 (저장이 확실히 된 후 실행)
-        # ---------------------------------------------------------
+        
+        # 매도 보상 지급 (저장이 확실히 된 후 실행)
         try:
             # 1. 매도 경험치 20점 지급
             #await gain_exp(trade.user_id, 20)
@@ -317,66 +316,100 @@ async def sell_stock(trade: TradeRequest, db: aiosqlite.Connection = Depends(get
 # 주문 요청 모델
 class OrderRequest(BaseModel):
     user_id: int
-    company_name: str
-    order_type: str  # 'BUY' 또는 'SELL'
-    price: float     # 희망 가격
+    ticker: str = None          # 신규 방식
+    company_name: str = None    # 기존 호환용
+    order_type: str  
+    price: int
     quantity: int
 
 @router.post("/order")
-async def place_order(order: OrderRequest, db: aiosqlite.Connection = Depends(get_db_connection)):
+async def place_order(req: OrderRequest):
     """
-    [지정가 주문 접수]
-    - 매수 주문: 미리 돈을 차감해두고 대기 상태로 만듭니다. (체결 안 되면 취소 시 환불)
-    - 매도 주문: 미리 주식을 차감해두고 대기 상태로 만듭니다.
+    사용자의 주문을 DB에 저장하고, 동시에 '진짜 엔진'으로 전송합니다.
     """
-    total_amount = order.price * order.quantity
+    # 호환성 처리: ticker가 없으면 company_name을 씁니다.
+    target_ticker = req.ticker if req.ticker else req.company_name
     
+    # 안전장치: 종목명이 아예 없으면 에러
+    if not target_ticker:
+        raise HTTPException(status_code=400, detail="종목명(ticker)이 필요합니다.")
+
+    db = await get_db_connection()
     try:
-        await db.execute("BEGIN IMMEDIATE")
+        # 1. 유효성 및 자산 검증
+        if req.price <= 0 or req.quantity <= 0:
+            raise HTTPException(status_code=400, detail="가격과 수량은 양수여야 합니다.")
 
-        if order.order_type == "BUY":
-            # [매수] 잔액 확인 및 차감 (돈 묶어두기)
-            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (order.user_id,))
+        if req.order_type == "BUY":
+            total_cost = req.price * req.quantity
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (req.user_id,))
             row = await cursor.fetchone()
-            if not row or row[0] < total_amount:
-                raise HTTPException(status_code=400, detail="주문 가능 잔액이 부족합니다.")
+            if not row or row['balance'] < total_cost:
+                raise HTTPException(status_code=400, detail="현금이 부족합니다.")
             
-            new_balance = row[0] - total_amount
-            await db.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, order.user_id))
-            
-        elif order.order_type == "SELL":
-            # [매도] 주식 보유량 확인 및 차감 (주식 묶어두기)
-            cursor = await db.execute("SELECT quantity FROM holdings WHERE user_id = ? AND company_name = ?", (order.user_id, order.company_name))
+            # 매수: 미리 돈 차감 (Locking)
+            new_balance = row['balance'] - total_cost
+            await db.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, req.user_id))
+                
+        elif req.order_type == "SELL":
+            cursor = await db.execute("SELECT quantity FROM holdings WHERE user_id = ? AND company_name = ?", (req.user_id, target_ticker))
             row = await cursor.fetchone()
-            if not row or row[0] < order.quantity:
-                raise HTTPException(status_code=400, detail="매도 가능 주식이 부족합니다.")
+            if not row or row['quantity'] < req.quantity:
+                raise HTTPException(status_code=400, detail="보유 주식이 부족합니다.")
             
-            new_qty = row[0] - order.quantity
-            await db.execute("UPDATE holdings SET quantity = ? WHERE user_id = ? AND company_name = ?", (new_qty, order.user_id, order.company_name))
+            # 매도: 미리 주식 차감 (Locking)
+            new_qty = row['quantity'] - req.quantity
+            await db.execute("UPDATE holdings SET quantity = ? WHERE user_id = ? AND company_name = ?", (new_qty, req.user_id, target_ticker))
 
-        else:
-            raise HTTPException(status_code=400, detail="잘못된 주문 타입입니다. (BUY/SELL만 가능)")
-
-        # 주문장에 기록 (Status: PENDING)
-        await db.execute("""
-            INSERT INTO orders (user_id, company_name, order_type, price, quantity)
-            VALUES (?, ?, ?, ?, ?)
-        """, (order.user_id, order.company_name, order.order_type, order.price, order.quantity))
+        # 2. DB에 'PENDING' 상태로 저장
+        cursor = await db.execute("""
+            INSERT INTO orders (user_id, company_name, order_type, price, quantity, status)
+            VALUES (?, ?, ?, ?, ?, 'PENDING')
+            RETURNING id
+        """, (req.user_id, target_ticker, req.order_type, req.price, req.quantity))
         
+        order_row = await cursor.fetchone()
+        new_order_id = order_row[0]
         await db.commit()
-        return {"status": "success", "message": f"{order.company_name} {order.price}원 지정가 주문이 접수되었습니다."}
+        
+        # 엔진으로 주문 전송!
+        try:
+            from main import engine
+            
+            side = OrderSide.BUY if req.order_type == "BUY" else OrderSide.SELL
+            
+            user_order = Order(
+                agent_id=f"User_{req.user_id}",
+                ticker=target_ticker,
+                side=side,
+                order_type=OrderType.LIMIT,
+                quantity=req.quantity,
+                price=req.price
+            )
+            
+            engine.place_order(user_order)
+            print(f"🙋‍♂️ [사용자 주문] {target_ticker} {req.order_type} {req.quantity}주 @ {req.price}원 -> 엔진 전송 완료!")
 
+        except Exception as e:
+            print(f"⚠️ [전송 실패] 엔진 에러: {e}")
+
+        return {"status": "success", "order_id": new_order_id, "msg": "주문이 정상 접수되었습니다."}
+
+    except HTTPException as e:
+        await db.rollback()
+        raise e
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"주문 접수 실패: {str(e)}")
-
+        print(f"❌ 주문 에러: {e}")
+        raise HTTPException(status_code=500, detail="서버 에러")
+    finally:
+        await db.close()
 @router.get("/orders/{user_id}")
 async def get_my_orders(user_id: int, db: aiosqlite.Connection = Depends(get_db_connection)):
     """
     [내 주문 내역 조회] 
     반드시 '아직 체결되지 않은(PENDING)' 주문만 가져와야 합니다.
     """
-    # 🔴 수정 포인트: AND status = 'PENDING' 이 꼭 있어야 함!
     cursor = await db.execute("""
         SELECT id, company_name, order_type, price, quantity, created_at, status
         FROM orders 
